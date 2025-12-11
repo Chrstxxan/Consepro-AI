@@ -1,0 +1,24 @@
+# ---- PASTAS PESADAS ----
+data/
+processed_txt/
+vectorstore/
+ingest_state.json
+
+# ---- ARQUIVOS TEMP / CACHE ----
+__pycache__/
+*.pkl
+*.log
+*.tmp
+
+# ---- VENV ----
+venv/
+.env
+
+# ---- SISTEMA ----
+.DS_Store
+Thumbs.db
+
+# ---- ARQUIVOS PDF E DOC ----
+*.pdf
+*.doc
+*.docx
