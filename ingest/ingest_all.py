@@ -46,10 +46,8 @@ def ingest_one(pdf_path: Path):
     # Processa (OCR ou texto normal)
     txt = extract_text_from_document(pdf_path)
 
-    # Caminho do txt no processed_txt
-    rel = pdf_path.relative_to(ROOT)
-    out_path = Path("processed_txt") / rel
-    out_path = out_path.with_suffix(".txt")
+    # Caminho correto dentro de data/processed_txt/
+    out_path = Path(output_path(str(pdf_path)))
     out_path.parent.mkdir(parents=True, exist_ok=True)
     out_path.write_text(txt, encoding="utf-8")
 

@@ -1,5 +1,5 @@
 from fastapi import FastAPI
-from rag_engine import answer
+from api.rag_engine import answer
 from pydantic import BaseModel
 from dotenv import load_dotenv
 load_dotenv()

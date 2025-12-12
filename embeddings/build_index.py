@@ -4,52 +4,83 @@ import faiss
 import numpy as np
 from embedder import embed
 from dotenv import load_dotenv
-load_dotenv()
 from pathlib import Path
+import unicodedata
 
-TXT_ROOT = "processed_txt"
+load_dotenv()
+
+TXT_ROOT = "data/processed_txt"
 META_OUT = "embeddings/metadata.json"
 INDEX_OUT = "embeddings/vector_store.faiss"
 
 os.makedirs("embeddings", exist_ok=True)
 
-indexed_state_file = "index_state.json"
-
-def load_index_state():
-    if Path(indexed_state_file).exists():
-        return json.loads(Path(indexed_state_file).read_text())
-    return {}
-
-def save_index_state(state):
-    Path(indexed_state_file).write_text(json.dumps(state, indent=2))
-
 def list_txts():
-    for root,_,files in os.walk(TXT_ROOT):
+    for root, _, files in os.walk(TXT_ROOT):
         for f in files:
             if f.endswith(".txt"):
-                yield os.path.join(root,f)
+                yield os.path.join(root, f)
+
+def is_valid_vector(v):
+    return (
+        v is not None
+        and isinstance(v, (list, np.ndarray))
+        and len(v) > 0
+    )
+
+def fix_string(s):
+    """Garante que strings terão apenas caracteres UTF-8 válidos."""
+    return (
+        unicodedata.normalize("NFC", s)
+        .encode("utf-8", "replace")
+        .decode("utf-8", "replace")
+    )
 
 def build():
     metadata = []
     vectors = []
 
-    for path in list_txts():
-        with open(path,"r",encoding="utf-8") as f:
-            content = f.read()
+    txt_files = list(list_txts())
+    print(f" TXT encontrados: {len(txt_files)}")
 
-        vec = embed(content)
-        vectors.append(vec)
-        metadata.append({"path": path})
+    for path in txt_files:
+        try:
+            content = Path(path).read_text(encoding="utf-8")
+            content = content[:5000]  # limita tamanho
+
+            vec = embed(content)
+
+            if not is_valid_vector(vec) or len(vec) != 768:
+                print(f"[SKIP] Vetor inválido ou dimensão errada em {path}")
+                continue
+
+            vectors.append(vec)
+            metadata.append({"path": fix_string(path)})
+
+        except Exception as e:
+            print(f"[ERRO] Falha ao processar {path}: {e}")
+            continue
+
+    if len(vectors) == 0:
+        print(" ERRO: Nenhum embedding válido!")
+        return
 
     arr = np.array(vectors).astype("float32")
+
+    print(f" Dimensão dos vetores: {arr.shape}")
 
     index = faiss.IndexFlatL2(arr.shape[1])
     index.add(arr)
 
     faiss.write_index(index, INDEX_OUT)
-    json.dump(metadata, open(META_OUT,"w",encoding="utf-8"), ensure_ascii=False, indent=2)
 
-    print(f"🎉 Index construído com {len(metadata)} documentos!")
+    # salva metadata limpo
+    clean_json = json.dumps(metadata, indent=2, ensure_ascii=False)
+    Path(META_OUT).write_text(clean_json, encoding="utf-8")
+
+    print(f" Index construído com {len(metadata)} documentos!")
+    print(f" FAISS salvo em {INDEX_OUT}")
+    print(f" Metadata salvo em {META_OUT}")
 
 if __name__ == "__main__":
     build()
