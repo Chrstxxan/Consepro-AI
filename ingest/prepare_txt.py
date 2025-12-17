@@ -1,87 +1,106 @@
 import os
+import re
 from pathlib import Path
-import unicodedata
 
-from extract_text import extract_text_pdf, extract_text_docx
-from ocr_local import ocr_pdf
+# --------------------------------------------------
+# CONFIG
+# --------------------------------------------------
 
+RAW_TXT_ROOT = "data/raw_txt"          # onde chegam os txt extraídos do PDF
+OUT_ROOT = "data/processed_txt"        # pasta final
+INVEST_DIR = os.path.join(OUT_ROOT, "investimentos")
+ADMIN_DIR = os.path.join(OUT_ROOT, "administrativos")
 
-# ---------------------------------------------------------
-# Helpers de limpeza
-# ---------------------------------------------------------
+os.makedirs(INVEST_DIR, exist_ok=True)
+os.makedirs(ADMIN_DIR, exist_ok=True)
 
-def clean_text(t: str) -> str:
-    if not t:
-        return ""
-    t = t.replace("\r", " ").replace("\u00A0", " ")
-    t = t.strip()
-    return t
+# --------------------------------------------------
+# PALAVRAS-CHAVE DE INVESTIMENTOS
+# --------------------------------------------------
 
+KEYWORDS_INVEST = [
+    "comitê de investimentos",
+    "politica de investimentos",
+    "política de investimentos",
+    "alocação",
+    "renda fixa",
+    "renda variável",
+    "gestor",
+    "gestores",
+    "benchmark",
+    "meta atuarial",
+    "rentabilidade",
+    "performance",
+    "aplicações",
+    "investimentos",
+    "fundo",
+    "títulos públicos",
+    "títulos federais",
+]
 
-def normalize(t: str):
-    return "".join(
-        c for c in unicodedata.normalize("NFKD", t)
-        if not unicodedata.combining(c)
-    )
+# --------------------------------------------------
+# UTILIDADES
+# --------------------------------------------------
 
+def normalize(text: str) -> str:
+    text = text.lower()
+    text = re.sub(r"\s+", " ", text)
+    return text
 
-# ---------------------------------------------------------
-# Função principal exigida pelo ingest_all.py
-# ---------------------------------------------------------
+def is_investment_doc(text: str) -> bool:
+    text = normalize(text)
+    hits = sum(1 for k in KEYWORDS_INVEST if k in text)
+    return hits >= 2   # regra segura
 
-def extract_text_from_document(path):
-    """
-    Decide automaticamente:
-    - Se é PDF → tenta extrair texto normal
-        • Se tiver muito pouco texto → faz OCR
-    - Se é DOCX → usa extrator de DOCX
-    - Se é DOC → ignora ou tenta conversão externa no futuro
-    """
+def clean_text(text: str) -> str:
+    lines = []
+    for line in text.splitlines():
+        line = line.strip()
+        if len(line) < 3:
+            continue
+        lines.append(line)
+    return "\n".join(lines)
 
-    path = Path(path)
-    ext = path.suffix.lower()
+# --------------------------------------------------
+# PROCESSAMENTO
+# --------------------------------------------------
 
-    # ------------------------------
-    # PDF
-    # ------------------------------
-    if ext == ".pdf":
+def process_all():
+    txt_files = list(Path(RAW_TXT_ROOT).rglob("*.txt"))
+
+    print(f"📄 TXT encontrados: {len(txt_files)}")
+
+    invest_count = 0
+    admin_count = 0
+
+    for path in txt_files:
         try:
-            txt = extract_text_pdf(path)
-        except Exception:
-            txt = ""
+            raw_text = path.read_text(encoding="utf-8", errors="ignore")
+            text = clean_text(raw_text)
 
-        # Se o PDF está praticamente vazio → provavelmente é escaneado
-        if not txt or len(txt.strip()) < 30:
-            print(f"[OCR LOCAL] Documento escaneado detectado → {path}")
-            try:
-                txt = ocr_pdf(path)
-            except Exception as e:
-                print(f"[OCR LOCAL] Erro ao fazer OCR em {path}: {e}")
-                txt = ""
+            if not text:
+                continue
 
-        return clean_text(txt)
+            if is_investment_doc(text):
+                out_dir = INVEST_DIR
+                invest_count += 1
+            else:
+                out_dir = ADMIN_DIR
+                admin_count += 1
 
-    # ------------------------------
-    # DOCX
-    # ------------------------------
-    elif ext == ".docx":
-        try:
-            txt = extract_text_docx(path)
-            return clean_text(txt)
+            out_path = os.path.join(out_dir, path.name)
+            Path(out_path).write_text(text, encoding="utf-8")
+
         except Exception as e:
-            print(f"[DOCX] Erro ao extrair texto de {path}: {e}")
-            return ""
+            print(f"[ERRO] {path}: {e}")
 
-    # ------------------------------
-    # DOC (não suportado)
-    # ------------------------------
-    elif ext == ".doc":
-        print(f"[WARN] Arquivo .doc não suportado diretamente: {path}")
-        return ""
+    print("✅ Processamento concluído")
+    print(f"📊 Investimentos: {invest_count}")
+    print(f"📊 Administrativos: {admin_count}")
 
-    # ------------------------------
-    # Outro tipo inesperado
-    # ------------------------------
-    else:
-        print(f"[WARN] Tipo de arquivo desconhecido: {path}")
-        return ""
+# --------------------------------------------------
+# MAIN
+# --------------------------------------------------
+
+if __name__ == "__main__":
+    process_all()
