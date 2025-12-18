@@ -16,9 +16,42 @@ META_PATH = os.path.join(BASE_DIR, "..", "embeddings", "metadata.json")
 INDEX = faiss.read_index(INDEX_PATH)
 META = json.load(open(META_PATH, encoding="utf-8"))
 
-# --------------------------------------------------
-# DETECTORES
-# --------------------------------------------------
+# ==================================================
+# 🔍 HEURÍSTICAS DE EXTRAÇÃO (SEM METADATA)
+# ==================================================
+
+def infer_rpps_from_text(text: str):
+    patterns = [
+        r"\bIPRE[A-Z]+\b",
+        r"\bIPREM[A-Z]+\b",
+        r"\bInstituto de Previdência(?: do| da)? ([A-ZÁ-Ú][A-Za-zÁ-Úãõç\s]+)",
+        r"\bRPPS(?: do| da)? ([A-ZÁ-Ú][A-Za-zÁ-Úãõç\s]+)"
+    ]
+
+    found = set()
+    for p in patterns:
+        for m in re.findall(p, text, flags=re.IGNORECASE):
+            if isinstance(m, tuple):
+                found.add(m[0].strip())
+            else:
+                found.add(m.strip())
+
+    return sorted(found)
+
+def infer_date_from_text(text: str):
+    m = re.search(
+        r"(janeiro|fevereiro|março|abril|maio|junho|julho|agosto|setembro|outubro|novembro|dezembro)\s+de\s+(20\d{2})",
+        text.lower()
+    )
+    if m:
+        return f"{m.group(1)} de {m.group(2)}"
+
+    m = re.search(r"(20\d{2})", text)
+    return m.group(1) if m else "data não identificada"
+
+# ==================================================
+# 🔎 DETECTORES DE INTENÇÃO
+# ==================================================
 
 def is_summary_query(q: str) -> bool:
     q = q.lower()
@@ -31,129 +64,79 @@ def is_analytical_query(q: str) -> bool:
         "quem está",
         "quem pretende",
         "quem quer",
-        "tendência",
-        "panorama"
+        "existe processo",
+        "há processo",
+        "seleção de gestores",
+        "renda fixa",
+        "macro alocação"
     ])
 
-def extract_date_from_query(q: str):
-    m = re.search(r"(20\d{2})[^\d]?(\d{2})?", q)
-    if not m:
-        return None
-    year = m.group(1)
-    month = m.group(2)
-    return f"{year}-{month}" if month else year
+# ==================================================
+# 🔎 BUSCA SEMÂNTICA
+# ==================================================
 
-def extract_gestor_from_query(q: str):
-    m = re.search(r"gestor\s+(.+)", q.lower())
-    if m:
-        return m.group(1).strip()
-    return None
-
-# --------------------------------------------------
-# CONSULTAS ESTRUTURAIS
-# --------------------------------------------------
-
-def rpps_by_gestor(nome):
-    return sorted({
-        m["rpps"]
-        for m in META
-        if m.get("gestor") and nome.lower() in m["gestor"].lower()
-    })
-
-def docs_by_date(target):
-    return [
-        m for m in META
-        if m.get("date") and m["date"].startswith(target)
-    ]
-
-# --------------------------------------------------
-# BUSCA SEMÂNTICA
-# --------------------------------------------------
-
-def semantic_search(query, k=8):
+def semantic_search(query, k=40):
     q = np.array([embed(query)]).astype("float32")
     _, I = INDEX.search(q, k)
     return [META[i] for i in I[0]]
 
-# --------------------------------------------------
-# SELEÇÃO DIVERSIFICADA POR RPPS (🔥 CORREÇÃO DO VIÉS)
-# --------------------------------------------------
-
-def select_diverse_docs(docs, max_per_rpps=3, max_total=40):
-    by_rpps = {}
-
-    for d in docs:
-        rpps = d.get("rpps")
-        if not rpps:
-            continue
-        by_rpps.setdefault(rpps, []).append(d)
-
-    # prioriza documentos mais recentes por RPPS
-    for rpps in by_rpps:
-        by_rpps[rpps].sort(
-            key=lambda x: x.get("date") or "",
-            reverse=True
-        )
-
-    selected = []
-    for rpps_docs in by_rpps.values():
-        selected.extend(rpps_docs[:max_per_rpps])
-
-    return selected[:max_total]
-
-# --------------------------------------------------
-# ANSWER
-# --------------------------------------------------
+# ==================================================
+# 🧠 ANSWER
+# ==================================================
 
 def answer(query: str) -> str:
     ql = query.lower()
 
-    # ------------------------------
-    # 1️⃣ RPPS por gestor
-    # ------------------------------
-    gestor = extract_gestor_from_query(ql)
-    if gestor:
-        rpps = rpps_by_gestor(gestor)
-        if rpps:
-            return (
-                f"Os RPPS que utilizam o gestor {gestor} são:\n- "
-                + "\n- ".join(rpps)
-            )
-        return f"Não foi encontrado RPPS associado ao gestor {gestor}."
-
-    # ------------------------------
-    # 2️⃣ MODO ANALÍTICO (ex: renda fixa)
-    # ------------------------------
+    # --------------------------------------------------
+    # 🔹 MODO ANALÍTICO (RENDA FIXA, PROCESSOS, ETC)
+    # --------------------------------------------------
     if is_analytical_query(ql):
-        keywords = []
 
-        if "renda fixa" in ql:
-            keywords.append("renda fixa")
+        expansion = """
+        renda fixa títulos públicos tesouro nacional pré-fixado pós-fixado
+        NTN LTN LFT CDI fundos conservadores
+        análise estudo proposta deliberação aprovação apresentação
+        gestores credenciamento performance
+        """
 
-        if keywords:
-            raw_docs = [
-                m for m in META
-                if any(k in m.get("text", "").lower() for k in keywords)
-            ]
+        faiss_docs = semantic_search(expansion + " " + query)
 
-            docs = select_diverse_docs(raw_docs)
+        keywords = [
+            "renda fixa", "títulos", "tesouro", "ntn", "ltn", "lft",
+            "alocação", "deliberação", "aprovação", "estudo",
+            "gestor", "gestores", "credenciamento", "performance"
+        ]
 
-            if not docs:
-                return "Não foram encontradas atas relevantes para essa análise."
+        selected = []
+        for d in faiss_docs:
+            text = d.get("text", "").lower()
+            if any(k in text for k in keywords):
+                selected.append(d)
 
-            context = "\n\n".join(
-                f"[RPPS: {d.get('rpps')} | Data: {d.get('date')}]\n{d.get('text')}"
-                for d in docs
-            )
+        if not selected:
+            # 🔥 fallback semântico (NUNCA responder vazio)
+            selected = faiss_docs[:8]
 
-            prompt = f"""
-Você é um analista financeiro especializado em RPPS.
+        context_blocks = []
+        for d in selected:
+            text = d.get("text", "")
+            rpps = infer_rpps_from_text(text)
+            date = infer_date_from_text(text)
 
-Com base nas atas abaixo:
-- identifique entidades que demonstrem interesse, intenção ou deliberação
-  relacionada ao tema consultado.
-- considere estudos, propostas, aprovações ou discussões.
-- se não houver evidência clara, deixe isso explícito.
+            header = f"[Entidade(s): {', '.join(rpps) if rpps else 'não identificada'} | Data: {date}]"
+            context_blocks.append(header + "\n" + text[:2500])
+
+        context = "\n\n".join(context_blocks)
+
+        prompt = f"""
+Você é um analista sênior especializado em RPPS.
+
+Objetivo:
+- Identificar entidades que demonstrem interesse, análise, estudo,
+  discussão ou deliberação relacionada ao tema da pergunta.
+- NÃO exija decisão formal explícita.
+- Use indícios, análises e menções contextuais.
+- Se não houver decisão, explique o estágio (ex: estudo, análise, debate).
 
 DOCUMENTOS:
 {context}
@@ -161,57 +144,73 @@ DOCUMENTOS:
 PERGUNTA:
 {query}
 
-Responda listando as entidades e explicando brevemente o contexto.
+Responda listando as entidades em tópicos e explicando o contexto.
 Não invente informações.
 """
 
-            resp = openai.chat.completions.create(
-                model="gpt-4o-mini",
-                messages=[
-                    {"role": "system", "content": "Analise apenas com base nos documentos fornecidos."},
-                    {"role": "user", "content": prompt}
-                ],
-                max_tokens=700
-            )
-
-            return resp.choices[0].message.content.strip()
-
-    # ------------------------------
-    # 3️⃣ RESUMO POR DATA
-    # ------------------------------
-    date = extract_date_from_query(ql)
-    if date and is_summary_query(ql):
-        docs = docs_by_date(date)
-        if not docs:
-            return f"Não há atas disponíveis para o período {date}."
-
-        docs = select_diverse_docs(docs, max_per_rpps=2, max_total=30)
-
-        context = "\n\n".join(
-            f"[RPPS: {d.get('rpps')} | Data: {d.get('date')}]\n{d.get('text')}"
-            for d in docs
+        resp = openai.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[
+                {"role": "system", "content": "Analise exclusivamente os documentos fornecidos."},
+                {"role": "user", "content": prompt}
+            ],
+            max_tokens=900
         )
 
-    # ------------------------------
-    # 4️⃣ BUSCA SEMÂNTICA NORMAL
-    # ------------------------------
-    else:
-        docs = semantic_search(query)
-        docs = select_diverse_docs(docs, max_per_rpps=1, max_total=8)
+        return resp.choices[0].message.content.strip()
+
+    # --------------------------------------------------
+    # 🔹 RESUMOS
+    # --------------------------------------------------
+    if is_summary_query(ql):
+        docs = semantic_search(query, k=12)
 
         context = "\n\n".join(
-            f"[RPPS: {d.get('rpps')} | Data: {d.get('date')}]\n{d.get('text')}"
-            for d in docs
+            d.get("text", "")[:3000] for d in docs
         )
+
+        prompt = f"""
+Você é um analista especializado em RPPS.
+
+Tarefa:
+- Elaborar um resumo executivo claro e objetivo
+- Destacar decisões, análises, estudos e encaminhamentos
+- Agrupar informações semelhantes
+
+DOCUMENTOS:
+{context}
+
+PERGUNTA:
+{query}
+"""
+
+        resp = openai.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[
+                {"role": "system", "content": "Resuma apenas com base nos documentos."},
+                {"role": "user", "content": prompt}
+            ],
+            max_tokens=800
+        )
+
+        return resp.choices[0].message.content.strip()
+
+    # --------------------------------------------------
+    # 🔹 BUSCA PADRÃO
+    # --------------------------------------------------
+    docs = semantic_search(query, k=8)
+
+    context = "\n\n".join(
+        d.get("text", "")[:2500] for d in docs
+    )
 
     prompt = f"""
 Você é um analista especializado em atas de RPPS.
 
 Regras:
-- Use somente as informações fornecidas
-- Inferir intenções apenas quando houver indícios claros
-- Não inventar dados
-- Responder de forma objetiva e profissional
+- Use apenas as informações fornecidas
+- Seja objetivo
+- Não invente dados
 
 DOCUMENTOS:
 {context}
