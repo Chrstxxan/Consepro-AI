@@ -72,7 +72,6 @@ def semantic_search(query: str, k: int = 40):
 
 def infer_rpps_from_text(text: str):
     t = text.upper()
-
     if any(b in t for b in BANCO_KEYWORDS):
         return []
 
@@ -87,19 +86,8 @@ def infer_rpps_from_text(text: str):
 
 def infer_date_from_text(text: str):
     text = text.lower()
-
-    m = re.search(
-        r"(janeiro|fevereiro|março|abril|maio|junho|julho|agosto|setembro|outubro|novembro|dezembro)\s+de\s+(20\d{2})",
-        text
-    )
-    if m:
-        return f"{m.group(1)} de {m.group(2)}"
-
     m = re.search(r"(20\d{2})", text)
-    if m:
-        return m.group(1)
-
-    return "data não identificada"
+    return m.group(1) if m else "data não identificada"
 
 def temporal_score(meta: dict) -> int:
     ano = meta.get("ano")
@@ -112,6 +100,43 @@ def temporal_score(meta: dict) -> int:
     return 1
 
 # ==================================================
+# 🆕 ADIÇÃO GLOBAL — LISTA REAL DE RPPS
+# ==================================================
+
+def get_all_rpps():
+    rpps = set()
+    for m in META:
+        for r in m.get("rpps", []):
+            rpps.add(r)
+    return sorted(rpps)
+
+# ==================================================
+# 🆕 ADIÇÃO GLOBAL — 1 DOC RECENTE POR RPPS
+# ==================================================
+
+def get_recent_doc_for_rpps(rpps, keywords):
+    candidates = []
+
+    for d in META:
+        if rpps not in d.get("rpps", []):
+            continue
+
+        ano = d.get("ano")
+        if not ano or ano < CURRENT_YEAR - 3:
+            continue
+
+        text = d.get("text", "").lower()
+        if not any(k in text for k in keywords):
+            continue
+
+        candidates.append(d)
+
+    if not candidates:
+        return None
+
+    return sorted(candidates, key=lambda x: x.get("ano", 0), reverse=True)[0]
+
+# ==================================================
 # 🧠 ANSWER
 # ==================================================
 
@@ -119,7 +144,7 @@ def answer(query: str) -> str:
     ql = query.lower()
 
     # --------------------------------------------------
-    # 🔹 ANALÍTICO
+    # 🔹 MODO ANALÍTICO
     # --------------------------------------------------
     if is_analytical_query(ql):
 
@@ -131,7 +156,8 @@ def answer(query: str) -> str:
         alocação diretrizes estudo acompanhamento
         """
 
-        docs = semantic_search(expansion + " " + query)
+        # mantém FAISS (não removido)
+        _ = semantic_search(expansion + " " + query)
 
         keywords = [
             "gestor", "gestores", "credenciamento", "seleção",
@@ -140,72 +166,36 @@ def answer(query: str) -> str:
             "comitê", "estudo", "avaliação", "acompanhamento"
         ]
 
-        # ----------------------------
-        # 1️⃣ FILTRO + SCORE TEMPORAL
-        # ----------------------------
-        scored_docs = []
-        for d in docs:
-            text = d.get("text", "")
-            if not any(k in text.lower() for k in keywords):
-                continue
-            scored_docs.append((temporal_score(d), d))
+        # ==================================================
+        # 🆕 ADIÇÃO CRÍTICA — ENTIDADE FIRST (PERGUNTA ABERTA)
+        # ==================================================
 
-        if not scored_docs:
-            scored_docs = [(1, d) for d in docs]
-
-        scored_docs.sort(key=lambda x: x[0], reverse=True)
-
-        # ----------------------------
-        # 2️⃣ AGRUPA POR RPPS (ANTI-MONOPÓLIO)
-        # ----------------------------
-        rpps_docs = {}
-
-        for _, d in scored_docs:
-            text = d.get("text", "")
-
-            rpps_list = infer_rpps_from_text(text)
-
-            if not rpps_list:
-                meta_rpps = d.get("rpps", [])
-                if meta_rpps:
-                    rpps_list = meta_rpps
-
-            # ⚠️ documentos sem RPPS entram só como CONTEXTO
-            if not rpps_list:
-                continue
-
-            date = infer_date_from_text(text)
-
-            for rpps in rpps_list:
-                rpps_docs.setdefault(rpps, []).append({
-                    "date": date,
-                    "text": text[:1800]
-                })
-
-        if not rpps_docs:
-            return (
-                "Foram identificados registros institucionais relevantes relacionados "
-                "ao tema consultado. No entanto, os documentos não permitem associar "
-                "esses registros a RPPS específicos para fins de contato direto, "
-                "servindo como indicativos gerais de movimentação institucional."
-            )
-
-        # ----------------------------
-        # 3️⃣ DIVERSIDADE + ALEATORIEDADE
-        # ----------------------------
-        rpps_keys = list(rpps_docs.keys())
-        random.shuffle(rpps_keys)
-
-        rpps_keys = rpps_keys[:5]  # máx. 5 institutos por resposta
+        all_rpps = get_all_rpps()
+        random.shuffle(all_rpps)
 
         blocks = []
-        for rpps in rpps_keys:
-            items = rpps_docs[rpps][:2]  # máx. 2 docs por RPPS
-            joined = "\n\n".join(
-                f"(Data: {i['date']})\n{i['text']}"
-                for i in items
+        MAX_RPPS_TOTAL = 20
+
+        for rpps in all_rpps:
+            doc = get_recent_doc_for_rpps(rpps, keywords)
+            if not doc:
+                continue
+
+            text = doc.get("text", "")[:1500]
+            ano = doc.get("ano")
+
+            blocks.append(
+                f"[RPPS: {rpps}]\n(Ano: {ano})\n{text}"
             )
-            blocks.append(f"[RPPS: {rpps}]\n{joined}")
+
+            if len(blocks) >= MAX_RPPS_TOTAL:
+                break
+
+        if not blocks:
+            return (
+                "Foram analisados diversos RPPS, porém não foram encontrados "
+                "registros recentes e relevantes relacionados ao tema consultado."
+            )
 
         context = "\n\n".join(blocks)
 
@@ -220,11 +210,11 @@ def answer(query: str) -> str:
 Você é um analista sênior especializado em RPPS.
 
 Diretrizes:
-- Analise o contexto dos documentos.
-- Priorize informações mais recentes.
-- Identifique sinais institucionais relevantes.
+- Pergunta aberta: listar o MAIOR NÚMERO POSSÍVEL de RPPS.
+- Cada RPPS representa uma entidade distinta.
+- Priorize documentos recentes.
 - Não invente nomes, cargos ou números.
-- Seja claro, responsável e analítico.
+- Seja direto e orientado à decisão.
 
 Estilo da resposta: {tone}.
 
@@ -234,7 +224,7 @@ DOCUMENTOS:
 PERGUNTA:
 {query}
 
-Responda explicando o que foi identificado para cada RPPS.
+Responda analisando cada RPPS listado.
 """
 
         resp = openai.chat.completions.create(
@@ -249,14 +239,11 @@ Responda explicando o que foi identificado para cada RPPS.
         return resp.choices[0].message.content.strip()
 
     # --------------------------------------------------
-    # 🔹 RESUMO
+    # 🔹 MODO RESUMO (INALTERADO)
     # --------------------------------------------------
     if is_summary_query(ql):
         docs = semantic_search(query, k=12)
-
-        context = "\n\n".join(
-            d.get("text", "")[:3000] for d in docs
-        )
+        context = "\n\n".join(d.get("text", "")[:3000] for d in docs)
 
         prompt = f"""
 Você é um analista especializado em RPPS.
@@ -285,13 +272,10 @@ PERGUNTA:
         return resp.choices[0].message.content.strip()
 
     # --------------------------------------------------
-    # 🔹 PADRÃO
+    # 🔹 BUSCA PADRÃO (INALTERADO)
     # --------------------------------------------------
     docs = semantic_search(query, k=8)
-
-    context = "\n\n".join(
-        d.get("text", "")[:2500] for d in docs
-    )
+    context = "\n\n".join(d.get("text", "")[:2500] for d in docs)
 
     prompt = f"""
 Você é um analista especializado em atas de RPPS.
