@@ -8,6 +8,9 @@ import openai
 from datetime import datetime
 from embeddings.embedder import embed
 
+# 🆕 fuzzy matching
+from rapidfuzz import fuzz
+
 # ==================================================
 # 🔑 CONFIG
 # ==================================================
@@ -37,9 +40,75 @@ RPPS_PATTERNS = [
     r"\bIPRE[A-Z]{2,}\b",
     r"\bIPREM[A-Z]{2,}\b",
     r"\bIPRES[A-Z]{2,}\b",
+    r"\bIPREV[A-Z]{2,}\b",
     r"\b[A-Z]{3,15}\sPREV\b",
     r"INSTITUTO DE PREVID[ÊE]NCIA[^\n]{0,80}"
 ]
+
+# ==================================================
+# 🆕 NORMALIZAÇÃO CANÔNICA
+# ==================================================
+
+def normalize_rpps_name(name: str) -> str:
+    if not name:
+        return ""
+
+    n = name.upper()
+    n = re.sub(r"[^A-Z ]", " ", n)
+    n = re.sub(r"\s+", " ", n).strip()
+
+    blacklist = [
+        "INSTITUTO DE PREVIDENCIA",
+        "INSTITUTO DE PREVIDÊNCIA",
+        "INSTITUTO PREVIDENCIA",
+        "DOS SERVIDORES PUBLICOS",
+        "DOS SERVIDORES PÚBLICOS",
+        "SERVIDORES PUBLICOS",
+        "SERVIDORES PÚBLICOS",
+        "MUNICIPIO DE",
+        "MUNICÍPIO DE"
+    ]
+
+    for b in blacklist:
+        n = n.replace(b, "")
+
+    return n.strip()
+
+# ==================================================
+# 🆕 SIGLA ÂNCORA
+# ==================================================
+
+def extract_sigla(name: str):
+    m = re.search(
+        r"\bIPRE[A-Z]{2,6}\b|\bIPRES[A-Z]{2,6}\b|\bIPREV[A-Z]{2,6}\b",
+        name
+    )
+    return m.group(0) if m else None
+
+# ==================================================
+# 🆕 MATCH DE RPPS (SIGLA + FUZZY)
+# ==================================================
+
+def is_same_rpps(a: str, b: str) -> bool:
+    a_norm = normalize_rpps_name(a)
+    b_norm = normalize_rpps_name(b)
+
+    if not a_norm or not b_norm:
+        return False
+
+    # 1️⃣ match direto
+    if a_norm == b_norm:
+        return True
+
+    # 2️⃣ sigla âncora
+    sig_a = extract_sigla(a_norm)
+    sig_b = extract_sigla(b_norm)
+    if sig_a and sig_b and sig_a == sig_b:
+        return True
+
+    # 3️⃣ fuzzy (fallback)
+    score = fuzz.token_set_ratio(a_norm, b_norm)
+    return score >= 85
 
 # ==================================================
 # 🔍 INTENÇÃO
@@ -78,7 +147,7 @@ def infer_rpps_from_text(text: str):
     encontrados = set()
     for p in RPPS_PATTERNS:
         for m in re.findall(p, t):
-            nome = m.strip()
+            nome = normalize_rpps_name(m.strip())
             if 6 <= len(nome) <= 60:
                 encontrados.add(nome)
 
@@ -89,52 +158,35 @@ def infer_date_from_text(text: str):
     m = re.search(r"(20\d{2})", text)
     return m.group(1) if m else "data não identificada"
 
-def temporal_score(meta: dict) -> int:
-    ano = meta.get("ano")
-    if not ano:
-        return 0
-    if ano >= CURRENT_YEAR - 1:
-        return 3
-    if ano >= CURRENT_YEAR - 3:
-        return 2
-    return 1
-
 # ==================================================
-# 🆕 ADIÇÃO GLOBAL — LISTA REAL DE RPPS
+# 🆕 TOP N ATAS POR RPPS (INALTERADO)
 # ==================================================
 
-def get_all_rpps():
-    rpps = set()
-    for m in META:
-        for r in m.get("rpps", []):
-            rpps.add(r)
-    return sorted(rpps)
-
-# ==================================================
-# 🆕 ADIÇÃO GLOBAL — 1 DOC RECENTE POR RPPS
-# ==================================================
-
-def get_recent_doc_for_rpps(rpps, keywords):
-    candidates = []
+def get_top_docs_for_rpps(rpps_name, keywords, limit):
+    docs = []
 
     for d in META:
-        if rpps not in d.get("rpps", []):
+        meta_rpps = [
+            normalize_rpps_name(r)
+            for r in d.get("rpps", [])
+        ]
+
+        # 🆕 match inteligente
+        if not any(is_same_rpps(rpps_name, mr) for mr in meta_rpps):
             continue
 
         ano = d.get("ano")
-        if not ano or ano < CURRENT_YEAR - 3:
+        if not ano:
             continue
 
         text = d.get("text", "").lower()
         if not any(k in text for k in keywords):
             continue
 
-        candidates.append(d)
+        docs.append(d)
 
-    if not candidates:
-        return None
-
-    return sorted(candidates, key=lambda x: x.get("ano", 0), reverse=True)[0]
+    docs.sort(key=lambda x: x.get("ano", 0), reverse=True)
+    return docs[:limit]
 
 # ==================================================
 # 🧠 ANSWER
@@ -143,9 +195,6 @@ def get_recent_doc_for_rpps(rpps, keywords):
 def answer(query: str) -> str:
     ql = query.lower()
 
-    # --------------------------------------------------
-    # 🔹 MODO ANALÍTICO
-    # --------------------------------------------------
     if is_analytical_query(ql):
 
         expansion = """
@@ -156,7 +205,6 @@ def answer(query: str) -> str:
         alocação diretrizes estudo acompanhamento
         """
 
-        # mantém FAISS (não removido)
         _ = semantic_search(expansion + " " + query)
 
         keywords = [
@@ -166,65 +214,69 @@ def answer(query: str) -> str:
             "comitê", "estudo", "avaliação", "acompanhamento"
         ]
 
-        # ==================================================
-        # 🆕 ADIÇÃO CRÍTICA — ENTIDADE FIRST (PERGUNTA ABERTA)
-        # ==================================================
-
-        all_rpps = get_all_rpps()
-        random.shuffle(all_rpps)
-
+        target_rpps = infer_rpps_from_text(query)
         blocks = []
-        MAX_RPPS_TOTAL = 20
 
-        for rpps in all_rpps:
-            doc = get_recent_doc_for_rpps(rpps, keywords)
-            if not doc:
-                continue
+        # --------------------------------------------------
+        # 🔹 RPPS ESPECÍFICO → TOP 8
+        # --------------------------------------------------
+        if target_rpps:
+            rpps = target_rpps[0]
+            docs = get_top_docs_for_rpps(rpps, keywords, limit=8)
 
-            text = doc.get("text", "")[:1500]
-            ano = doc.get("ano")
+            for d in docs:
+                blocks.append(
+                    f"[RPPS: {rpps}]\n(Ano: {d.get('ano')})\n{d.get('text','')[:1800]}"
+                )
 
-            blocks.append(
-                f"[RPPS: {rpps}]\n(Ano: {ano})\n{text}"
-            )
+        # --------------------------------------------------
+        # 🔹 PERGUNTA ABERTA → TOP 5 POR RPPS
+        # --------------------------------------------------
+        else:
+            all_rpps = set()
+            for m in META:
+                for r in m.get("rpps", []):
+                    all_rpps.add(normalize_rpps_name(r))
 
-            if len(blocks) >= MAX_RPPS_TOTAL:
-                break
+            all_rpps = list(all_rpps)
+            random.shuffle(all_rpps)
+
+            for rpps in all_rpps:
+                docs = get_top_docs_for_rpps(rpps, keywords, limit=5)
+                if not docs:
+                    continue
+
+                joined = "\n\n".join(
+                    f"(Ano: {d.get('ano')})\n{d.get('text','')[:1200]}"
+                    for d in docs
+                )
+
+                blocks.append(f"[RPPS: {rpps}]\n{joined}")
+
+                if len(blocks) >= 20:
+                    break
 
         if not blocks:
             return (
-                "Foram analisados diversos RPPS, porém não foram encontrados "
-                "registros recentes e relevantes relacionados ao tema consultado."
+                "Os documentos analisados não apresentam informações "
+                "suficientes e recentes relacionadas à pergunta."
             )
 
         context = "\n\n".join(blocks)
-
-        tone = random.choice([
-            "explique de forma analítica",
-            "responda como um relatório executivo",
-            "responda destacando evidências institucionais",
-            "responda de forma técnica e objetiva"
-        ])
 
         prompt = f"""
 Você é um analista sênior especializado em RPPS.
 
 Diretrizes:
-- Pergunta aberta: listar o MAIOR NÚMERO POSSÍVEL de RPPS.
-- Cada RPPS representa uma entidade distinta.
-- Priorize documentos recentes.
+- Utilize exclusivamente os documentos fornecidos.
 - Não invente nomes, cargos ou números.
-- Seja direto e orientado à decisão.
-
-Estilo da resposta: {tone}.
+- Agrupe informações por RPPS.
 
 DOCUMENTOS:
 {context}
 
 PERGUNTA:
 {query}
-
-Responda analisando cada RPPS listado.
 """
 
         resp = openai.chat.completions.create(
@@ -239,51 +291,14 @@ Responda analisando cada RPPS listado.
         return resp.choices[0].message.content.strip()
 
     # --------------------------------------------------
-    # 🔹 MODO RESUMO (INALTERADO)
+    # 🔹 OUTROS MODOS (INALTERADOS)
     # --------------------------------------------------
-    if is_summary_query(ql):
-        docs = semantic_search(query, k=12)
-        context = "\n\n".join(d.get("text", "")[:3000] for d in docs)
 
-        prompt = f"""
-Você é um analista especializado em RPPS.
-
-Tarefa:
-- Produzir um resumo executivo claro
-- Destacar decisões, análises e encaminhamentos
-- Indicar quando não houver informação explícita
-
-DOCUMENTOS:
-{context}
-
-PERGUNTA:
-{query}
-"""
-
-        resp = openai.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=[
-                {"role": "system", "content": "Resuma apenas com base nos documentos."},
-                {"role": "user", "content": prompt}
-            ],
-            max_tokens=800
-        )
-
-        return resp.choices[0].message.content.strip()
-
-    # --------------------------------------------------
-    # 🔹 BUSCA PADRÃO (INALTERADO)
-    # --------------------------------------------------
     docs = semantic_search(query, k=8)
     context = "\n\n".join(d.get("text", "")[:2500] for d in docs)
 
     prompt = f"""
 Você é um analista especializado em atas de RPPS.
-
-Regras:
-- Utilize apenas informações dos documentos
-- Não invente dados
-- Seja objetivo, mas analítico
 
 DOCUMENTOS:
 {context}
